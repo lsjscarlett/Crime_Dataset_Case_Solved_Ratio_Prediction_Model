@@ -1,0 +1,1135 @@
+library(dplyr)
+library(ggplot2)
+library(ggthemes)
+library(tibble)
+library(tidyr)
+library(gmodels)
+library(plotly)
+library(viridis)
+library(gridExtra)
+library(janitor)
+library(reshape2)
+library(kableExtra)
+library(lubridate)
+library(mice)
+library(sf)
+library(lmtest)
+
+# read the raw data
+crime_dataset_rawdata <- read.csv('Crime_Data_from_2020_to_Present.csv')
+head(crime_dataset_rawdata)
+# remove unwanted columns
+crime_dataset <- crime_dataset_rawdata
+crime_dataset <- crime_dataset %>%
+  clean_names() %>%
+  select(-crm_cd_1, -crm_cd_2, -crm_cd_3, -crm_cd_4, -cross_street, -mocodes)
+summary(crime_dataset)
+
+#  Check null data and empty string
+colSums(is.na(crime_dataset))
+sapply(crime_dataset, function(x) any(x == "" | is.na(x)))
+
+sapply(crime_dataset, class)
+
+# Convert the date_rptd to Date object (ignoring the time part)
+crime_dataset$date_rptd <- as.Date(crime_dataset$date_rptd, format="%m/%d/%Y")
+# Convert the date_occ to Date object (ignoring the time part)
+crime_dataset$date_occ <- as.Date(crime_dataset$date_occ, format="%m/%d/%Y")
+
+# Extracting year, month, and day from date_occ and converting them to integer
+crime_dataset$year_occ <- as.integer(format(crime_dataset$date_occ, "%Y"))
+crime_dataset$month_occ <- as.integer(format(crime_dataset$date_occ, "%m"))
+crime_dataset$day_occ <- as.integer(format(crime_dataset$date_occ, "%d"))
+head(crime_dataset[c("date_occ", "year_occ", "month_occ", "day_occ")])
+
+# The time_occ column has digits range from 1-4, since the time_occ indicates the time of the crime, 1 and two digits time does not make sense. 
+# Check the ratio of the time with only 1-2 digits to see if it is ok to delete them.
+crime_dataset$time_occ <- as.character(crime_dataset$time_occ)
+count_digits <- function(x) {
+  nchar(gsub("[^0-9]", "", x)) # Remove non-numeric characters and count the length
+}
+crime_dataset$num_digits <- sapply(crime_dataset$time_occ, count_digits)
+digit_counts <- table(crime_dataset$num_digits)
+total_counts <- sum(digit_counts)
+proportions <- digit_counts / total_counts
+par(mar = c(5.1, 4.1, 4.1, 2.1))
+bp <- barplot(proportions, 
+              main = "Proportion of Number of Digits in time_occ", 
+              xlab = "Number of Digits", 
+              ylab = "Proportion", 
+              col = "yellowgreen",
+              ylim = c(0, max(proportions) * 1.1)) # increase y limit to make room for labels
+sapply(1:length(proportions), function(i) {
+  pos <- ifelse(proportions[i] > 0.95, 1, 3) # if the bar is too high, put the label inside
+  text(bp[i], proportions[i], label = round(proportions[i], 3), pos = pos, cex = 0.8)
+})
+# Exclude rows where time_occ has 1 or 2 digits
+crime_dataset <- crime_dataset[!(crime_dataset$num_digits %in% c(1, 2)), ]
+
+# Create a new column 'time_occ_continuous' where time is in continuous hours
+crime_dataset$time_occ <- as.character(crime_dataset$time_occ)
+# Pad strings with leading zeros if they are not 4 characters long
+crime_dataset$time_occ <- sprintf("%04s", crime_dataset$time_occ)
+crime_dataset$time_occ_continuous <- with(crime_dataset, {
+  hours <- as.numeric(substr(time_occ, 1, 2))
+  minutes <- as.numeric(substr(time_occ, 3, 4))
+  hours + minutes / 60
+})
+
+# Change the null values in weapon_used_cd to 500 because 500 is the unknown code
+crime_dataset$weapon_used_cd <- ifelse(is.na(crime_dataset$weapon_used_cd), "500", crime_dataset$weapon_used_cd)
+# Change the null values in weapon_desc to 'UNKNOWN WEAPON/OTHER WEAPON' 
+crime_dataset$weapon_desc <- ifelse(crime_dataset$weapon_desc == "", "UNKNOWN WEAPON/OTHER WEAPON", crime_dataset$weapon_desc)
+
+# Change the 0 values in vict_age to null.
+crime_dataset$vict_age <- ifelse(crime_dataset$vict_age <= 0, NA, crime_dataset$vict_age)
+crime_dataset <- crime_dataset[!is.na(crime_dataset$vict_age), ]
+
+# Change the empty string in vict_sex to NA
+crime_dataset$vict_sex <- ifelse(crime_dataset$vict_sex == "", "Unknown", crime_dataset$vict_sex)
+crime_dataset$vict_sex <- ifelse(crime_dataset$vict_sex == "X", "Unknown", crime_dataset$vict_sex)
+crime_dataset$vict_sex <- ifelse(crime_dataset$vict_sex == "H", "Unknown", crime_dataset$vict_sex)
+crime_dataset$vict_sex <- ifelse(crime_dataset$vict_sex == "-", "Unknown", crime_dataset$vict_sex)
+
+# Change the empty string in vict_descent to NA
+crime_dataset$vict_descent <- ifelse(crime_dataset$vict_descent == "", "Unknown", crime_dataset$vict_descent)
+
+# Change the null value in premis_cd column to Unknown
+crime_dataset$premis_cd <- ifelse(is.na(crime_dataset$premis_cd), "Unknown", crime_dataset$premis_cd)
+# Change the empty string in premis_desc to Unknown
+crime_dataset$premis_desc <- ifelse(crime_dataset$premis_desc == "", "Unknown", crime_dataset$premis_desc)
+
+# Delete unnecessary columns
+crime_dataset <- crime_dataset %>%
+  select(-num_digits)
+
+# Convert Categorical variables that are currently characters to factors so they can be used as predictors.
+crime_dataset$area <- as.factor(crime_dataset$area)
+crime_dataset$area_name <- as.factor(crime_dataset$area_name)
+crime_dataset$rpt_dist_no <- as.factor(crime_dataset$rpt_dist_no)
+crime_dataset$part_1_2 <- as.factor(crime_dataset$part_1_2)
+crime_dataset$crm_cd <- as.factor(crime_dataset$crm_cd)
+crime_dataset$crm_cd_desc <- as.factor(crime_dataset$crm_cd_desc)
+crime_dataset$vict_sex <- as.factor(crime_dataset$vict_sex)
+crime_dataset$vict_descent <- as.factor(crime_dataset$vict_descent)
+crime_dataset$premis_cd <- as.factor(crime_dataset$premis_cd)
+crime_dataset$premis_desc <- as.factor(crime_dataset$premis_desc)
+crime_dataset$weapon_used_cd <- as.factor(crime_dataset$weapon_used_cd)
+crime_dataset$weapon_desc <- as.factor(crime_dataset$weapon_desc)
+crime_dataset$status <- as.factor(crime_dataset$status)
+crime_dataset$status_desc <- as.factor(crime_dataset$status_desc)
+
+sapply(crime_dataset, class)
+
+
+# Delete 2023.09 and 2023.10 data
+crime_dataset <- crime_dataset[!(crime_dataset$year_occ == "2023" & crime_dataset$month_occ == "9"), ]
+crime_dataset <- crime_dataset[!(crime_dataset$year_occ == "2023" & crime_dataset$month_occ == "10"), ]
+
+# Write the dataset to a CSV file
+write.csv(crime_dataset, "crime_dataset_cleaned.csv", row.names = FALSE)
+
+######### PLOT below this 
+# Form the table of year, month, day, time
+summary_table <- data.frame(year_occ = NA, month_occ = NA, day_occ = NA, time_occ_continuous = NA)
+columns <- c("year_occ", "month_occ", "day_occ", "time_occ_continuous")  
+for (col in columns) {
+  summary <- crime_dataset %>%
+    summarise(
+      Count = n(),
+      Unique = n_distinct(.data[[col]]),
+      Top = names(which.max(table(.data[[col]]))),
+      Frequency = max(table(.data[[col]])))
+  
+  summary_table[1, col] <- summary$Count
+  summary_table[2, col] <- summary$Unique
+  summary_table[3, col] <- summary$Top
+  summary_table[4, col] <- summary$Frequency}
+
+rownames(summary_table) <- c("Count", "Unique", "Top", "Frequency")
+
+kable(summary_table, "html") %>%
+  kable_styling(full_width = FALSE) %>%
+  add_header_above(c(" " = 1, "Time Summary" = 4), align = "c", font_size = 20) %>%
+  column_spec(1, width = "20%", bold = TRUE) %>%
+  column_spec(2, width = "20%") %>%
+  column_spec(3, width = "20%") %>%
+  column_spec(4, width = "20%") 
+
+
+# Generate bar graph of years
+summary_by_year_occ <- crime_dataset %>%
+  group_by(year_occ) %>%
+  summarise(Total_Crimes = n() )
+print(summary_by_year_occ)
+
+ggplot(summary_by_year_occ, aes(x = year_occ, y = Total_Crimes)) +
+  geom_bar(stat = "identity", fill = "dodgerblue", width = 0.5) +  
+  geom_text(aes(label = Total_Crimes), vjust = -0.5, color = "black", size = 3.5) + 
+  labs(title = "Total Crimes by Year", x = "Year", y = "Total Crimes") +
+  theme_classic() + theme(plot.title = element_text(hjust = 0.5)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+
+# Generate Line Chart of total crimes by month and year
+summary_by_month_year <- crime_dataset %>%
+  filter(!(year_occ == 2023 & month_occ == 10)) %>% 
+  group_by(year_occ, month_occ) %>%
+  summarise(Total_Crimes = n()) %>%
+  arrange(year_occ, month_occ)  
+
+ggplot(summary_by_month_year, aes(x = as.factor(month_occ), y = Total_Crimes, group = as.factor(year_occ), color = as.factor(year_occ))) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Total Crimes by Month and Year", x = "Month", y = "Total Crimes", color = "Year") +
+  theme_classic() + theme(plot.title = element_text(hjust = 0.5)) +
+  scale_color_discrete(name = "Year")
+
+
+# Generate bar Chart of total crimes by areas in 2020
+crime_2020 <- crime_dataset %>%
+  filter(year_occ == 2020) %>%
+  group_by(area_name) %>%
+  summarise(Total_Crimes = n()) %>%
+  arrange(desc(Total_Crimes))
+
+average_crimes <- mean(crime_2020$Total_Crimes)
+
+ggplot(crime_2020, aes(x = reorder(area_name, Total_Crimes), y = Total_Crimes)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  geom_hline(yintercept = average_crimes, linetype = "dashed", color = "red") + 
+  geom_text(aes(x = 1, y = average_crimes, label = paste("Average: ", round(average_crimes))),
+            hjust = 0, vjust = -1, color = "red", size = 3.8) +  
+  labs(title = "Total Crimes by Area in 2020", x = "Area Name", y = "Total Crimes") +
+  theme_classic() + theme(plot.title = element_text(hjust = 0.5)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+# Generate bar Chart of total crimes by areas in 2021
+crime_2021 <- crime_dataset %>%
+  filter(year_occ == 2021) %>%
+  group_by(area_name) %>%
+  summarise(Total_Crimes = n()) %>%
+  arrange(desc(Total_Crimes))
+
+average_crimes <- mean(crime_2021$Total_Crimes)
+
+ggplot(crime_2021, aes(x = reorder(area_name, Total_Crimes), y = Total_Crimes)) +
+  geom_bar(stat = "identity", fill = "lightgreen") +
+  geom_hline(yintercept = average_crimes, linetype = "dashed", color = "red") + 
+  geom_text(aes(x = 1, y = average_crimes, label = paste("Average: ", round(average_crimes))),
+            hjust = 0, vjust = -1, color = "red", size = 3.8) +  
+  labs(title = "Total Crimes by Area in 2021", x = "Area Name", y = "Total Crimes") +
+  theme_classic() + theme(plot.title = element_text(hjust = 0.5)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+# Generate bar Chart of total crimes by areas in 2022
+crime_2022 <- crime_dataset %>%
+  filter(year_occ == 2022) %>%
+  group_by(area_name) %>%
+  summarise(Total_Crimes = n()) %>%
+  arrange(desc(Total_Crimes))
+
+average_crimes <- mean(crime_2022$Total_Crimes)
+
+ggplot(crime_2022, aes(x = reorder(area_name, Total_Crimes), y = Total_Crimes)) +
+  geom_bar(stat = "identity", fill = "gold") +
+  geom_hline(yintercept = average_crimes, linetype = "dashed", color = "red") + 
+  geom_text(aes(x = 1, y = average_crimes, label = paste("Average: ", round(average_crimes))),
+            hjust = 0, vjust = -1, color = "red", size = 3.8) +  
+  labs(title = "Total Crimes by Area in 2022", x = "Area Name", y = "Total Crimes") +
+  theme_classic() + theme(plot.title = element_text(hjust = 0.5)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+# Generate bar Chart of total crimes by areas in 2021
+crime_2023 <- crime_dataset %>%
+  filter(year_occ == 2023) %>%
+  group_by(area_name) %>%
+  summarise(Total_Crimes = n()) %>%
+  arrange(desc(Total_Crimes))
+
+average_crimes <- mean(crime_2023$Total_Crimes)
+
+ggplot(crime_2023, aes(x = reorder(area_name, Total_Crimes), y = Total_Crimes)) +
+  geom_bar(stat = "identity", fill = "lavender") +
+  geom_hline(yintercept = average_crimes, linetype = "dashed", color = "red") + 
+  geom_text(aes(x = 1, y = average_crimes, label = paste("Average: ", round(average_crimes))),
+            hjust = 0, vjust = -1, color = "red", size = 3.8) +  
+  labs(title = "Total Crimes by Area in 2023 (Jan-Aug)", x = "Area Name", y = "Total Crimes") +
+  theme_classic() + theme(plot.title = element_text(hjust = 0.5)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# generate bar graph of age
+
+age_counts <- crime_dataset %>%
+  filter(!is.na(vict_age) & vict_age >= 0) %>%
+  mutate(age_group = cut(vict_age, breaks = c(0, 17, 35, 51, 69, 86, Inf),
+                         labels = c("0-17", "18-35", "36-51", "52-69", "69-86", "86+"))) %>%
+  group_by(age_group) %>%
+  summarise(count = n())
+
+print(age_counts)
+
+ggplot(age_counts, aes(x = age_group, y = count)) +
+  geom_bar(stat = "identity", width = 0.5, fill = c("#D3D3D3", "#fc8d62", "#D3D3D3", "#D3D3D3", "#D3D3D3", "#808080")) +
+  geom_text(aes(label = count),
+            position = position_stack(vjust = 1.05),
+            size = 3.5, hjust = 0.5, color = "black") +
+  labs(title = "Victim Age Count Distribution", x = "Age Group", y = "Count") +
+  scale_y_continuous(labels = scales::comma) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5))
+
+
+# generate bar graph of weapon used
+weapon_used_counts <- crime_dataset %>%
+  filter(!is.na(weapon_used_cd)) %>%
+  group_by(weapon_used_cd) %>%    
+  summarise(count = n()) %>%
+  arrange(desc(count)) %>%
+  mutate(weapon_used_cd = ifelse(row_number() <= 5, as.character(weapon_used_cd), "others")) %>%
+  group_by(weapon_used_cd) %>%
+  summarise(count = sum(count))
+weapon_used_counts <- weapon_used_counts %>%
+  mutate(fill_color = ifelse(row_number() <= 5, as.character(weapon_used_cd), "Other"))
+print(weapon_used_counts)
+
+ggplot(weapon_used_counts, aes(x = weapon_used_cd, y = count, fill = fill_color)) +
+  geom_bar(stat = "identity", width = 0.6) +
+  geom_text(aes(label = count), vjust = -0.5, color = "black", size = 3.5) +
+  scale_fill_manual(values = c("gold", "yellow", "#a6d854", "darkgreen", "lightgreen", "gray" ),
+                    labels = c("Gold", "Yellow", "Green", "Dark Green", "Light Green", "Other")) +
+  labs(title = "Total Weapon Used Distribution", x = "Weapon Used Code", y = "Count") +
+  scale_y_continuous(labels = scales::comma) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5))
+
+
+# Descriptive Statistics
+# vict_sex
+stats_sex <- crime_dataset %>%
+  group_by(vict_sex) %>%
+  summarise(Count = n())
+kable(stats_sex, format = "html", booktabs = TRUE, caption = "Descriptive Statistics by Victim Sex") %>%
+  kable_styling(full_width = FALSE, position = "center") %>%
+  column_spec(1, bold = TRUE) 
+
+#pie chart by sex 
+sex_category_counts <- crime_dataset %>%
+  group_by(vict_sex) %>%
+  summarise(count = n()) %>%
+  mutate(percentage = sprintf("%.2f%%", round(count / sum(count) * 100, 2))) %>%
+  filter(vict_sex != "-")
+
+print(sex_category_counts)
+
+p <- ggplot(sex_category_counts, aes(x = "", y = count, fill = vict_sex)) +
+  geom_bar(stat = "identity", na.rm = TRUE) +
+  coord_polar(theta = "y") +
+  geom_text(aes(label = percentage), position = position_stack(vjust = 0.5), size = 4.5) +
+  theme_void() +
+  theme(plot.title = element_text(hjust = 0.5))
+p <- p +
+  scale_fill_manual(values = c("F" = "pink", "M" = "dodgerblue", "Unknown" = "#D3D3D3")) +  
+  labs(title = "Crimes Victims Distribution by Sex") 
+print(p)
+
+
+# generate bar graph of descent
+descent_counts <- crime_dataset %>%
+  filter(!is.na(vict_descent)) %>%
+  group_by(vict_descent) %>%    
+  summarise(count = n()) %>%
+  arrange(desc(count)) %>%
+  mutate(vict_descent = ifelse(row_number() <= 3, as.character(vict_descent), "others")) %>%
+  group_by(vict_descent) %>%
+  summarise(count = sum(count))
+
+kable(descent_counts, format = "html", booktabs = TRUE, caption = "Descriptive Statistics by Victim Descent") %>%
+  kable_styling(full_width = FALSE, position = "center") %>%
+  column_spec(1, bold = TRUE) 
+print(descent_counts)
+
+p <- ggplot(descent_counts, aes(x = "", y = count, fill = vict_descent)) +
+  geom_bar(stat = "identity") +
+  coord_polar(theta = "y") +
+  geom_text(aes(label = sprintf("%.2f%%", count / sum(count) * 100)), 
+            position = position_stack(vjust = 0.5), 
+            size = 4.5, color = "black") +
+  scale_fill_manual(values = c("B" = "dodgerblue", "H" = "orange", "W" = "lavender", "others" = "#D3D3D3")) +  
+  theme_void() +
+  labs(title = "Crimes Victims Distribution by Descent") + theme(plot.title = element_text(hjust = 0.5))
+print(p)
+
+
+
+# crm_cd + crm_cd_desc
+stats_crime <- crime_dataset %>%
+  group_by(crm_cd, crm_cd_desc) %>%
+  summarise(Count = n())
+top_10_crimes <- stats_crime %>%
+  arrange(desc(Count)) %>%
+  head(10)
+kable(top_10_crimes, format = "html", booktabs = TRUE, caption = "Descriptive Statistics by Top 10 Crime") %>%
+  kable_styling(full_width = FALSE, position = "center") %>%
+  column_spec(1, bold = TRUE) 
+
+ggplot(top_10_crimes, aes(x = reorder(crm_cd, -Count), y = Count)) +
+  geom_bar(stat = "identity", fill = "gold", width = 0.7) +
+  geom_text(aes(label = Count), vjust = -0.5, size = 3.5) +  # 添加文本标签
+  labs(
+    title = "Distribution of Top 10 Crime",
+    x = "Crime",
+    y = "Frequency") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8)) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+# premis_cd + premis_desc
+stats_premis <- crime_dataset %>%
+  group_by(premis_cd, premis_desc) %>%
+  summarise(Count = n())
+top_10_premis <- stats_premis %>%
+  arrange(desc(Count)) %>%
+  head(10)
+kable(top_10_premis, format = "html", booktabs = TRUE, caption = "Descriptive Statistics by Top 10 Premis") %>%
+  kable_styling(full_width = FALSE, position = "center") %>%
+  column_spec(1, bold = TRUE)
+
+ggplot(top_10_premis, aes(x = reorder(premis_cd, -Count), y = Count)) +
+  geom_bar(stat = "identity", fill = "dodgerblue", width = 0.7) +
+  geom_text(aes(label = Count), vjust = -0.5, size = 3.5) +
+  labs(
+    title = "Distribution of Top 10 Premis",
+    x = "Premis",
+    y = "Frequency"
+  ) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8))
+
+
+
+# Inferential Statistics
+# Question 1: Does the holiday season experiences less crime compared to other times of the year?
+# Null Hypothesis H0: There is no difference in the average number of crimes during the holiday season and the rest of the year.
+# Alternative Hypothesis H1: There is a difference in the average number of crimes during the holiday season and the rest of the year. 
+# Filter data for 2020,2021,2022 in a specific area
+crime_dataset_filtered <- filter(crime_dataset, year_occ != 2023)
+holiday_season <- filter(crime_dataset_filtered, month_occ %in% c(11, 12))
+not_holiday_season <- filter(crime_dataset_filtered, !month_occ %in% c(11, 12))
+# Calculate daily crime counts for each period
+daily_counts_holiday_season <- table(format(holiday_season$date_occ, "%Y-%m-%d"))
+daily_counts_not_holiday_season <- table(format(not_holiday_season$date_occ, "%Y-%m-%d"))
+# Perform two-sample t-test
+test_result <- t.test(as.numeric(daily_counts_holiday_season), as.numeric(daily_counts_not_holiday_season))
+# Print the results
+print(test_result)
+
+all_dates <- unique(c(names(daily_counts_holiday_season), names(daily_counts_not_holiday_season)))
+density_data <- data.frame(
+  Date = rep(all_dates, each = 2),
+  CrimeCount = c(as.numeric(daily_counts_holiday_season[all_dates]), as.numeric(daily_counts_not_holiday_season[all_dates])),
+  Season = rep(c("Holiday Season", "Not Holiday Season"), each = length(all_dates)))
+
+
+density_data <- density_data[is.finite(density_data$CrimeCount), ]
+
+# Calculate the mean Crime Counts for Holiday Season and Not Holiday Season
+mean_crime_holiday <- mean(density_data$CrimeCount[density_data$Season == "Holiday Season"], na.rm = TRUE)
+mean_crime_not_holiday <- mean(density_data$CrimeCount[density_data$Season == "Not Holiday Season"], na.rm = TRUE)
+
+# Create density plot with annotations and vertical lines for means
+ggplot(density_data, aes(x = CrimeCount, fill = Season)) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Crime Comparison between Holiday and Not Holiday Seasons",
+       x = "Daily Crime Counts", y = "Density") +
+  scale_fill_manual(values = c("Holiday Season" = "gold", "Not Holiday Season" = "skyblue")) +
+  geom_vline(xintercept = mean_crime_holiday, linetype = "solid", color = "red") +
+  geom_vline(xintercept = mean_crime_not_holiday, linetype = "solid", color = "blue") +
+  annotate("text", x = mean_crime_holiday, y = 0, label = paste("Mean-H: ", round(mean_crime_holiday, 2)),
+           color = "chocolate", size = 4, hjust = 1.1, vjust = -31) +
+  annotate("text", x = mean_crime_not_holiday, y = 0, label = paste("Mean-NH: ", round(mean_crime_not_holiday, 2)),
+           color = "blue", size = 4, hjust = -0.1, vjust = -31) +
+  theme_classic()
+
+ 
+crime_dataset_filtered$date_occ <- as.Date(crime_dataset_filtered$date_occ)
+# Get Thanksgiving date for a given year
+thanksgiving_date <- function(year) {
+  # Calculate Thanksgiving date (4th Thursday of November)
+  ymd(paste(year, "-11-01")) + (4 - wday(ymd(paste(year, "-11-01")))) %% 7 + days(21)
+}
+# Filter data for the holiday season (from Thanksgiving to end of year)
+holiday_season <- filter(crime_dataset_filtered, 
+                         date_occ >= thanksgiving_date(year(date_occ)) & 
+                           date_occ <= ymd(paste(year(date_occ), "-12-31")))
+# Filter data for non-holiday season
+not_holiday_season <- filter(crime_dataset_filtered, 
+                             date_occ < thanksgiving_date(year(date_occ)) | 
+                               date_occ > ymd(paste(year(date_occ), "-12-31")))
+# Calculate daily crime counts for each period
+daily_counts_holiday_season <- table(format(holiday_season$date_occ, "%Y-%m-%d"))
+print(daily_counts_holiday_season)
+daily_counts_not_holiday_season <- table(format(not_holiday_season$date_occ, "%Y-%m-%d"))
+print(daily_counts_not_holiday_season)
+# Perform two-sample t-test
+test_result <- t.test(as.numeric(daily_counts_holiday_season), as.numeric(daily_counts_not_holiday_season))
+# Print the results
+print(test_result)
+
+all_dates <- unique(c(names(daily_counts_holiday_season), names(daily_counts_not_holiday_season)))
+density_data <- data.frame(
+  Date = rep(all_dates, each = 2),
+  CrimeCount = c(as.numeric(daily_counts_holiday_season[all_dates]), as.numeric(daily_counts_not_holiday_season[all_dates])),
+  Season = rep(c("Holiday Season", "Not Holiday Season"), each = length(all_dates)))
+
+density_data <- density_data[is.finite(density_data$CrimeCount), ]
+
+# Calculate the mean Crime Counts for Holiday Season and Not Holiday Season
+mean_crime_holiday <- mean(density_data$CrimeCount[density_data$Season == "Holiday Season"], na.rm = TRUE)
+mean_crime_not_holiday <- mean(density_data$CrimeCount[density_data$Season == "Not Holiday Season"], na.rm = TRUE)
+
+# Create density plot with annotations and vertical lines for means
+ggplot(density_data, aes(x = CrimeCount, fill = Season)) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Crime Comparison between Holiday (Thanksgiving) and Not Holiday Seasons",
+       x = "Daily Crime Counts", y = "Density") +
+  scale_fill_manual(values = c("Holiday Season" = "lightgreen", "Not Holiday Season" = "pink")) +
+  geom_vline(xintercept = mean_crime_holiday, linetype = "solid", color = "blue") +
+  geom_vline(xintercept = mean_crime_not_holiday, linetype = "solid", color = "red") +
+  annotate("text", x = mean_crime_holiday, y = 0, label = paste("Mean-H: ", round(mean_crime_holiday, 2)),
+           color = "darkgreen", size = 4, hjust = 1.1, vjust = -31) +
+  annotate("text", x = mean_crime_not_holiday, y = 0, label = paste("Mean-NH: ", round(mean_crime_not_holiday, 2)),
+           color = "red", size = 4, hjust = -0.1, vjust = -31) +
+  theme_classic()
+
+
+
+# Question 2: Whether the age of victims is 25?
+# Steps of conducting the hypothesis for p value of victim age
+# Clean the missing data of one column named vict_age in the crime_dataset and form the vict_age_data csv.
+cleaned_data <- crime_dataset[complete.cases(crime_dataset$vict_age), ]
+vict_age_data <- data.frame(dr_no = cleaned_data$dr_no, vict_age = cleaned_data$vict_age)
+print(vict_age_data)
+write.csv(vict_age_data, file = 'vict_age_data.csv', row.names = FALSE)
+# Conduct the hypothesis test.
+t_test_result <- t.test(vict_age_data$vict_age, mu = 25)
+print(t_test_result)
+p_value <- t_test_result$p.value
+mean_value <- t_test_result$estimate
+density_data <- data.frame(vict_age_data = vict_age_data$vict_age)
+# Create the density plot of victim age.
+ggplot(vict_age_data, aes(x = vict_age, fill = "Density")) +
+  geom_density(fill= "gold", alpha = 0.5) + 
+  theme_classic() +
+  labs(title = "Density Plot of victim Age",
+       x = "victim Age", y = "Density") +
+  geom_vline(xintercept = mean_value, linetype = "solid", color = "blue") + 
+  annotate("text", x = mean_value, y = 0.02, label = paste("Mean =", round(mean_value, 2)),
+           color = "blue", size = 4, hjust = -0.4, vjust = -1) + 
+  annotate("text", x = max(vict_age_data$vict_age), y = 0.03,
+           label = paste("p =", format.pval(p_value, digits = 4)),
+           color = "red", size = 4, hjust = 3, vjust = -15) + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+# Question 3 : Whether the average age of male is equal to the average age of females.
+# Two sample t test - gender 
+female_male_data <- crime_dataset[crime_dataset$vict_sex %in% c("F", "M"), ]
+# Select male data
+male_age <- female_male_data$vict_age[female_male_data$vict_sex == "M"]
+# Select female data
+female_age <- female_male_data$vict_age[female_male_data$vict_sex == "F"]
+# Two sample t_test
+t_test_result <- t.test(male_age, female_age)
+t_test_result
+p_value <- t_test_result$p.value
+ggplot(female_male_data, aes(x = vict_age, fill = vict_sex)) +
+  geom_density(alpha = 0.5) +
+  theme_classic() +
+  labs(title = "Density Plot of Victim Age by Gender",
+       x = "Victim Age", y = "Density") +
+  scale_fill_manual(values = c("M" = "lightblue", "F" = "pink")) +
+  annotate("text", x = max(female_male_data$vict_age), y = 0.03,
+           label = paste("p =", format.pval(p_value, digits = 4)),
+           color = "red", size = 4, hjust = 3, vjust = 1) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+
+
+crime_dataset_in_crime_total <- read.csv("crime_dataset_cleaned.csv")
+
+# check null and empty
+colSums(is.na(crime_dataset_in_crime_total))
+sapply(crime_dataset_in_crime_total, function(x) any(x == "" | is.na(x)))
+
+# shard by month
+crime_dataset_in_crime_total$month_seq <- paste(as.character(crime_dataset_in_crime_total$year_occ), 
+                                                as.character(crime_dataset_in_crime_total$month_occ), 
+                                                sep = '-')
+print(crime_dataset_in_crime_total$month_seq)
+
+# total
+temporary_crime_data <- crime_dataset_in_crime_total %>%
+  group_by(month_seq) %>%
+  summarize(total_crime = n(), .groups = 'drop')
+print(temporary_crime_data)
+
+# shard by crime code
+temporary_crime_code_data <- crime_dataset_in_crime_total %>%
+  group_by(month_seq, crm_cd) %>%
+  summarize(total_crime = n(), .groups = 'drop')
+temporary_crime_code_data$crm_cd <- paste('crm_cd_', temporary_crime_code_data$crm_cd, sep = '')
+print(temporary_crime_code_data)
+
+crime_code_data_spread <- temporary_crime_code_data %>%
+  pivot_wider(names_from = crm_cd, values_from = total_crime, values_fill = list(total_crime = 0))
+crime_code_data_spread <- crime_code_data_spread %>% 
+  select(month_seq, crm_cd_354, crm_cd_624, crm_cd_330, crm_cd_230, crm_cd_331)
+print(crime_code_data_spread)
+
+# join total
+crime_code_data_spread <- crime_code_data_spread %>%
+  inner_join(temporary_crime_data, by = "month_seq")
+print(crime_code_data_spread)
+
+# calculate ratio
+crime_code_data_spread$crm_cd_354 <- crime_code_data_spread$crm_cd_354 / crime_code_data_spread$total_crime
+crime_code_data_spread$crm_cd_624 <- crime_code_data_spread$crm_cd_624 / crime_code_data_spread$total_crime
+crime_code_data_spread$crm_cd_330 <- crime_code_data_spread$crm_cd_330 / crime_code_data_spread$total_crime
+crime_code_data_spread$crm_cd_230 <- crime_code_data_spread$crm_cd_230 / crime_code_data_spread$total_crime
+crime_code_data_spread$crm_cd_331 <- crime_code_data_spread$crm_cd_331 / crime_code_data_spread$total_crime
+crime_code_data_spread <- crime_code_data_spread %>% 
+  select(-total_crime)
+print(crime_code_data_spread)
+
+
+#shard by gender
+temporary_gender_data <- crime_dataset_in_crime_total %>%
+  group_by(month_seq, vict_sex) %>%
+  summarize(total_crime = n(), .groups = 'drop')
+print(temporary_gender_data)
+gender_data_spread <- temporary_gender_data %>%
+  pivot_wider(names_from = vict_sex, values_from = total_crime, values_fill = list(total_crime = 0))
+gender_data_spread <- gender_data_spread %>% 
+  select(-Unknown)
+print(gender_data_spread)
+
+# join total
+gender_data_spread <- gender_data_spread %>%
+  inner_join(temporary_crime_data, by = "month_seq")
+print(gender_data_spread)
+
+# calculate ratio
+gender_data_spread$M <- gender_data_spread$M / gender_data_spread$total_crime
+gender_data_spread$F <- gender_data_spread$F / gender_data_spread$total_crime
+gender_data_spread <- gender_data_spread %>% 
+  select(-total_crime)
+print(gender_data_spread)
+
+
+# shard by status code
+temporary_status_code_data <- crime_dataset_in_crime_total %>%
+  group_by(month_seq, status) %>%
+  summarize(total_crime = n(), .groups = 'drop')
+temporary_status_code_data$status <- paste('status_', temporary_status_code_data$status, sep = '')
+print(temporary_status_code_data)
+
+status_code_data_spread <- temporary_status_code_data %>%
+  pivot_wider(names_from = status, values_from = total_crime, values_fill = list(total_crime = 0))
+status_code_data_spread$AA_ratio <- status_code_data_spread$status_AA / (status_code_data_spread$status_AA
+                                                                         + status_code_data_spread$status_AO
+                                                                         + status_code_data_spread$status_IC
+                                                                         + status_code_data_spread$status_JA
+                                                                         + status_code_data_spread$status_JO
+                                                                         + status_code_data_spread$status_CC)
+status_code_data_spread <- status_code_data_spread %>% 
+  select(-status_AA, -status_AO, -status_IC, -status_JA, -status_JO, -status_CC)
+print(status_code_data_spread)
+
+#shard by weapon
+temporary_weapon_data <- crime_dataset_in_crime_total %>%
+  group_by(month_seq, weapon_used_cd) %>%
+  summarize(total_crime = n(), .groups = 'drop')
+temporary_weapon_data$weapon_used_cd <- paste('weapon_', temporary_weapon_data$weapon_used_cd, sep = '')
+print(temporary_weapon_data)
+
+weapon_data_spread <- temporary_weapon_data %>%
+  pivot_wider(names_from = weapon_used_cd, values_from = total_crime, values_fill = list(total_crime = 0))
+weapon_data_spread <- weapon_data_spread %>% 
+  select("month_seq", weapon_102, weapon_109, weapon_400, weapon_500, weapon_511)
+print(weapon_data_spread)
+
+weapon_data_spread$total = weapon_data_spread$weapon_102 + weapon_data_spread$weapon_109 + weapon_data_spread$weapon_400 + weapon_data_spread$weapon_500 + weapon_data_spread$weapon_511
+weapon_data_spread$weapon_102 <- weapon_data_spread$weapon_102 / weapon_data_spread$total
+weapon_data_spread$weapon_109 <- weapon_data_spread$weapon_109 / weapon_data_spread$total
+weapon_data_spread$weapon_400 <- weapon_data_spread$weapon_400 / weapon_data_spread$total
+weapon_data_spread$weapon_500 <- weapon_data_spread$weapon_500 / weapon_data_spread$total
+weapon_data_spread$weapon_511 <- weapon_data_spread$weapon_511 / weapon_data_spread$total
+weapon_data_spread <- weapon_data_spread %>% 
+  select(-total)
+print(weapon_data_spread)
+
+#shard by premis
+temporary_premis_data <- crime_dataset_in_crime_total %>%
+  group_by(month_seq, premis_cd) %>%
+  summarize(total_crime = n(), .groups = 'drop')
+temporary_premis_data$premis_cd <- paste('premis_', temporary_premis_data$premis_cd, sep = '')
+print(temporary_premis_data)
+
+premis_data_spread <- temporary_premis_data %>%
+  pivot_wider(names_from = premis_cd, values_from = total_crime, values_fill = list(total_crime = 0))
+premis_data_spread <- premis_data_spread %>% 
+  select("month_seq", premis_101, premis_501, premis_502, premis_108)
+print(premis_data_spread)
+
+# join total
+premis_data_spread <- premis_data_spread %>%
+  inner_join(temporary_crime_data, by = "month_seq")
+print(premis_data_spread)
+
+# calculate ratio
+premis_data_spread$premis_101 <- premis_data_spread$premis_101 / premis_data_spread$total_crime
+premis_data_spread$premis_501 <- premis_data_spread$premis_501 / premis_data_spread$total_crime
+premis_data_spread$premis_502 <- premis_data_spread$premis_502 / premis_data_spread$total_crime
+premis_data_spread$premis_108 <- premis_data_spread$premis_108 / premis_data_spread$total_crime
+premis_data_spread <- premis_data_spread %>% 
+  select(-total_crime)
+print(premis_data_spread)
+
+#shard by age group
+temporary_age_data <- crime_dataset_in_crime_total %>%
+  mutate(age_group = cut(vict_age, 
+                         breaks = c(-Inf, 17, 35, 51, 69, 86, Inf), 
+                         labels = c('age_0_17', 'age_18_35', 'age_36_51', 'age_52_69', 'age_70_86', 'age_86_above'),
+                         right = TRUE)) %>%
+  group_by(month_seq, age_group) %>%
+  summarize(total_crime = n(), .groups = 'drop')
+print(temporary_age_data)
+
+age_data_spread <- temporary_age_data %>%
+  pivot_wider(names_from = age_group, values_from = total_crime, values_fill = list(total_crime = 0))
+age_data_spread <- age_data_spread %>% 
+  select("month_seq", 'age_0_17', 'age_18_35', 'age_36_51', 'age_52_69', 'age_70_86', 'age_86_above')
+print(age_data_spread)
+
+# join total
+age_data_spread <- age_data_spread %>%
+  inner_join(temporary_crime_data, by = "month_seq")
+print(age_data_spread)
+
+# calculate ratio
+age_data_spread$age_0_17 <- age_data_spread$age_0_17 / age_data_spread$total_crime
+age_data_spread$age_18_35 <- age_data_spread$age_18_35 / age_data_spread$total_crime
+age_data_spread$age_36_51 <- age_data_spread$age_36_51 / age_data_spread$total_crime
+age_data_spread$age_52_69 <- age_data_spread$age_52_69 / age_data_spread$total_crime
+age_data_spread$age_70_86 <- age_data_spread$age_70_86 / age_data_spread$total_crime
+age_data_spread$age_86_above <- age_data_spread$age_86_above / age_data_spread$total_crime
+age_data_spread <- age_data_spread %>% 
+  select(-total_crime)
+print(age_data_spread)
+
+#shard by crime occurrence time group
+temporary_time_data <- crime_dataset_in_crime_total %>%
+  mutate(time_interval = cut(time_occ_continuous, 
+                             breaks = c(-Inf, 6, 12, 18, 24), 
+                             labels = c('time_midnight', 'time_morning', 'time_afternoon', 'time_night'),
+                             right = TRUE)) %>%
+  group_by(month_seq, time_interval) %>%
+  summarize(total_crime = n(), .groups = 'drop')
+print(temporary_time_data)
+
+time_data_spread <- temporary_time_data %>%
+  pivot_wider(names_from = time_interval, values_from = total_crime, values_fill = list(total_crime = 0))
+time_data_spread <- time_data_spread %>% 
+  select("month_seq", 'time_midnight', 'time_morning', 'time_afternoon', 'time_night')
+print(time_data_spread)
+
+# join total
+time_data_spread <- time_data_spread %>%
+  inner_join(temporary_crime_data, by = "month_seq")
+print(time_data_spread)
+
+# calculate ratio
+time_data_spread$time_midnight <- time_data_spread$time_midnight / time_data_spread$total_crime
+time_data_spread$time_morning <- time_data_spread$time_morning / time_data_spread$total_crime
+time_data_spread$time_afternoon <- time_data_spread$time_afternoon / time_data_spread$total_crime
+time_data_spread$time_night <- time_data_spread$time_night / time_data_spread$total_crime
+time_data_spread <- time_data_spread %>% 
+  select(-total_crime)
+print(time_data_spread)
+
+#shard by ethnicity
+temporary_ethnicity_data <- crime_dataset_in_crime_total %>%
+  group_by(month_seq, vict_descent) %>%
+  summarize(total_crime = n(), .groups = 'drop')
+temporary_ethnicity_data$vict_descent <- paste('ethnicity_', temporary_ethnicity_data$vict_descent, sep = '')
+print(temporary_ethnicity_data)
+
+ethnicity_data_spread <- temporary_ethnicity_data %>%
+  pivot_wider(names_from = vict_descent, values_from = total_crime, values_fill = list(total_crime = 0))
+ethnicity_data_spread <- ethnicity_data_spread %>% 
+  select("month_seq", ethnicity_H, ethnicity_W, ethnicity_B)
+print(ethnicity_data_spread)
+
+# join total
+ethnicity_data_spread <- ethnicity_data_spread %>%
+  inner_join(temporary_crime_data, by = "month_seq")
+print(ethnicity_data_spread)
+
+# calculate ratio
+ethnicity_data_spread$ethnicity_H <- ethnicity_data_spread$ethnicity_H / ethnicity_data_spread$total_crime
+ethnicity_data_spread$ethnicity_W <- ethnicity_data_spread$ethnicity_W / ethnicity_data_spread$total_crime
+ethnicity_data_spread$ethnicity_B <- ethnicity_data_spread$ethnicity_B / ethnicity_data_spread$total_crime
+
+ethnicity_data_spread <- ethnicity_data_spread %>% 
+  select(-total_crime)
+print(ethnicity_data_spread)
+
+# join all the dfs and this is the final aggregation
+data_spread <- gender_data_spread %>%
+  inner_join(crime_code_data_spread, by = "month_seq") %>%
+  inner_join(status_code_data_spread, by = "month_seq") %>%
+  inner_join(weapon_data_spread, by = "month_seq") %>%
+  inner_join(age_data_spread, by = "month_seq") %>%
+  inner_join(premis_data_spread, by = "month_seq") %>%
+  inner_join(time_data_spread, by = "month_seq") %>%
+  inner_join(ethnicity_data_spread, by = "month_seq")
+print(data_spread)
+
+
+# heat map
+correlation_data <- data_spread[, c('AA_ratio', 'M', 'F',
+                                    'crm_cd_624',
+                                    'crm_cd_330',
+                                    'crm_cd_354',
+                                    'crm_cd_230',
+                                    'crm_cd_331',
+                                    'weapon_102',
+                                    'weapon_109',
+                                    'weapon_400',
+                                    'weapon_500',
+                                    'weapon_511',
+                                    'age_0_17', 
+                                    'age_18_35', 
+                                    'age_36_51', 
+                                    'age_52_69', 
+                                    'age_70_86', 
+                                    'age_86_above',
+                                    'premis_101', 
+                                    'premis_501', 
+                                    'premis_502', 
+                                    'premis_108',
+                                    'time_midnight', 
+                                    'time_morning', 
+                                    'time_afternoon', 
+                                    'time_night',
+                                    'ethnicity_H',
+                                    'ethnicity_W',
+                                    'ethnicity_B')]
+correlation_matrix <- cor(correlation_data)
+melted_correlation_matrix <- melt(correlation_matrix)
+heatmap_plot <- ggplot(data = melted_correlation_matrix, aes(Var1, Var2, fill = value)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "steelblue", high = "coral", mid = "lightblue", midpoint = 0, limit = c(-1,1), space = "Lab", name="Pearson\nCorrelation") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, size = 12, hjust = 1),
+        axis.text.y = element_text(size = 12)) +
+  labs(x = '', y = '', title = 'Correlation Matrix Heatmap')
+print(heatmap_plot)
+
+
+# linear regression
+# Age Variable Linear Regression
+age_long_data <- data_spread %>%
+  gather(key = "variable", value = "value", age_0_17, age_18_35, age_36_51, age_52_69, age_70_86, age_86_above)
+ggplot(age_long_data, aes(x = value, y = AA_ratio, color = variable)) +
+  geom_point(show.legend = FALSE) +  # Optional: Add the actual data points
+  geom_smooth(method = "lm", se = FALSE, show.legend = FALSE) +  # Add the regression lines
+  facet_wrap(~variable, scales = "free_x") +  # Create a separate plot for each variable
+  theme_minimal() +
+  labs(x = "Victim Age Ratio", y = "Case Solved Ratio", title = "Linear Regressions by Victim Age") +
+  scale_color_viridis_d()  
+
+# Create an empty data frame to store age results
+results_df <- data.frame()
+for (age_category in c('age_0_17', 'age_18_35', 'age_36_51', 'age_52_69', 'age_70_86', 'age_86_above')) {
+  
+  model <- lm(AA_ratio ~ get(age_category), data = correlation_data)
+  summary_info <- summary(model)
+  r_squared <- summary_info$r.squared
+  
+  cat("R-squared:", r_squared, "\n")
+  coefficients <- summary(model)$coefficients
+  results_df <- rbind(results_df, data.frame(
+    Age_Category = age_category,
+    Intercept = coefficients[1, 1],
+    Slope = coefficients[2, 1],
+    Std_Error = coefficients[2, 2],
+    T_Value = coefficients[2, 3],
+    P_Value = coefficients[2, 4]))}
+results_table <- kable(results_df, format = "html", 
+                       col.names = c("Age Group", "Intercept", "Slope", "Std Error", "T Value", "P Value"),
+                       caption = "Simple Linear Regression Results by Age Group") %>%
+  kable_styling(full_width = FALSE, position = "center")
+print(results_table)
+
+
+# Ethnicity Variable Linear Regression
+ethinicity_long_data <- data_spread %>%
+  gather(key = "variable", value = "value", ethnicity_H, ethnicity_W, ethnicity_B)
+ggplot(ethinicity_long_data, aes(x = value, y = AA_ratio, color = variable)) +
+  geom_point(show.legend = FALSE) +  # Optional: Add the actual data points
+  geom_smooth(method = "lm", se = FALSE, show.legend = FALSE) +  # Add the regression lines
+  facet_wrap(~variable, scales = "free_x") +  # Create a separate plot for each variable
+  theme_minimal() +
+  labs(x = "Victim Ethnicity Ratio", y = "Case Solved Ratio", title = "Linear Regressions by Victim Ethnicity") +
+  scale_color_viridis_d()  
+
+# Create an empty data frame to store ethnicity results
+results_df_ethnicity <- data.frame()
+for (ethnicity_category in c('ethnicity_H', 'ethnicity_W', 'ethnicity_B')) {
+  
+  model <- lm(AA_ratio ~ get(ethnicity_category), data = correlation_data)
+  
+  coefficients <- summary(model)$coefficients
+  results_df_ethnicity <- rbind(results_df_ethnicity, data.frame(
+    Ethnicity_Category = ethnicity_category,
+    Intercept = coefficients[1, 1],
+    Slope = coefficients[2, 1],
+    Std_Error = coefficients[2, 2],
+    T_Value = coefficients[2, 3],
+    P_Value = coefficients[2, 4]))}
+
+results_table_ethnicity <- kable(results_df_ethnicity, format = "html", 
+                                 col.names = c("Victim Ethnicity", "Intercept", "Slope", "Std Error", "T Value", "P Value"),
+                                 caption = "Simple Linear Regression Results by Victim Ethnicity") %>%
+  kable_styling(full_width = FALSE, position = "center")
+print(results_table_ethnicity)
+
+
+# Sex Variable Linear Regression
+sex_long_data <- data_spread %>%
+  gather(key = "variable", value = "value", F, M)
+ggplot(sex_long_data, aes(x = value, y = AA_ratio, color = variable)) +
+  geom_point(show.legend = FALSE) +  # Optional: Add the actual data points
+  geom_smooth(method = "lm", se = FALSE, show.legend = FALSE) +  # Add the regression lines
+  facet_wrap(~variable, scales = "free_x") +  # Create a separate plot for each variable
+  theme_minimal() +
+  labs(x = "Victim Gender Ratio", y = "Case Solved Ratio", title = "Linear Regressions by Victim Gender") +
+  scale_color_viridis_d()  
+
+# Create an empty data frame to store gender results
+results_df_sex <- data.frame()
+for (sex_category in c('F', 'M')) {
+  model <- lm(AA_ratio ~ get(sex_category), data = correlation_data)
+  coefficients <- summary(model)$coefficients
+  results_df_sex <- rbind(results_df_sex, data.frame(
+    Sex_Category = sex_category,
+    Intercept = coefficients[1, 1],
+    Slope = coefficients[2, 1],
+    Std_Error = coefficients[2, 2],
+    T_Value = coefficients[2, 3],
+    P_Value = coefficients[2, 4]))}
+
+results_table_sex <- kable(results_df_sex, format = "html", 
+                           col.names = c("Victim Genger", "Intercept", "Slope", "Std Error", "T Value", "P Value"),
+                           caption = "Simple Linear Regression Results by Victim Gender") %>%
+  kable_styling(full_width = FALSE, position = "center")
+print(results_table_sex)
+
+
+# Crime Type Variable Linear Regression
+crime_code_long_data <- data_spread %>%
+  gather(key = "variable", value = "value", crm_cd_354, crm_cd_624, crm_cd_330, crm_cd_230, crm_cd_331)
+ggplot(crime_code_long_data, aes(x = value, y = AA_ratio, color = variable)) +
+  geom_point(show.legend = FALSE) +  # Optional: Add the actual data points
+  geom_smooth(method = "lm", se = FALSE, show.legend = FALSE) +  # Add the regression lines
+  facet_wrap(~variable, scales = "free_x") +  # Create a separate plot for each variable
+  theme_minimal() +
+  labs(x = "Crime Type Ratio", y = "Case Solved Ratio", title = "Linear Regressions by Crime Type") +
+  scale_color_viridis_d()  
+
+# Create an empty data frame to store crime type results
+results_df_crime_code <- data.frame()
+for (crime_code_category in c('crm_cd_354', 'crm_cd_624', 'crm_cd_330', 'crm_cd_230', 'crm_cd_331')) {
+  
+  model <- lm(AA_ratio ~ get(crime_code_category), data = correlation_data)
+  
+  coefficients <- summary(model)$coefficients
+  results_df_crime_code <- rbind(results_df_crime_code, data.frame(
+    crime_code_Category = crime_code_category,
+    Intercept = coefficients[1, 1],
+    Slope = coefficients[2, 1],
+    Std_Error = coefficients[2, 2],
+    T_Value = coefficients[2, 3],
+    P_Value = coefficients[2, 4]))}
+
+results_table_crime_code <- kable(results_df_crime_code, format = "html", 
+                                  col.names = c("Crime Type", "Intercept", "Slope", "Std Error", "T Value", "P Value"),
+                                  caption = "Simple Linear Regression Results by Crime Type") %>%
+  kable_styling(full_width = FALSE, position = "center")
+print(results_table_crime_code)
+
+# Weapon Variable Linear Regression
+weapon_long_data <- data_spread %>%
+  gather(key = "variable", value = "value", weapon_102, weapon_109, weapon_400, weapon_500, weapon_511)
+ggplot(weapon_long_data, aes(x = value, y = AA_ratio, color = variable)) +
+  geom_point(show.legend = FALSE) +  # Optional: Add the actual data points
+  geom_smooth(method = "lm", se = FALSE, show.legend = FALSE) +  # Add the regression lines
+  facet_wrap(~variable, scales = "free_x") +  # Create a separate plot for each variable
+  theme_minimal() +
+  labs(x = "Weapon Used Type Ratio", y = "Case Solved Ratio", title = "Linear Regressions by Weapon Type") +
+  scale_color_viridis_d()  
+
+# Create an empty data frame to store weapon results
+results_df_weapon <- data.frame()
+for (weapon_category in c('weapon_102', 'weapon_109', 'weapon_400', 'weapon_500', 'weapon_511')) {
+  
+  model <- lm(AA_ratio ~ get(weapon_category), data = correlation_data)
+  coefficients <- summary(model)$coefficients
+  results_df_weapon <- rbind(results_df_weapon, data.frame(
+    Weapon_Category = weapon_category,
+    Intercept = coefficients[1, 1],
+    Slope = coefficients[2, 1],
+    Std_Error = coefficients[2, 2],
+    T_Value = coefficients[2, 3],
+    P_Value = coefficients[2, 4]))}
+
+results_table_weapon <- kable(results_df_weapon, format = "html", 
+                              col.names = c("Weapon Used Type", "Intercept", "Slope", "Std Error", "T Value", "P Value"),
+                              caption = "Simple Linear Regression Results by Weapon Used Type") %>%
+  kable_styling(full_width = FALSE, position = "center")
+print(results_table_weapon)
+
+
+
+# Premis Variable Linear Regression
+premis_long_data <- data_spread %>%
+  gather(key = "variable", value = "value", premis_101, premis_501, premis_502, premis_108)
+ggplot(premis_long_data, aes(x = value, y = AA_ratio, color = variable)) +
+  geom_point(show.legend = FALSE) +  # Optional: Add the actual data points
+  geom_smooth(method = "lm", se = FALSE, show.legend = FALSE) +  # Add the regression lines
+  facet_wrap(~variable, scales = "free_x") +  # Create a separate plot for each variable
+  theme_minimal() +
+  labs(x = "Victim Premis Type Ratio", y = "Case Solved Ratio", title = "Linear Regressions by Victim Premis Type") +
+  scale_color_viridis_d()  
+
+# Create an empty data frame to store premis results
+results_df_premis <- data.frame()
+for (premis_category in c('premis_101', 'premis_501', 'premis_502', 'premis_108')) {
+  
+  model <- lm(AA_ratio ~ get(premis_category), data = correlation_data)
+  coefficients <- summary(model)$coefficients
+  results_df_premis <- rbind(results_df_premis, data.frame(
+    premis_Category = premis_category,
+    Intercept = coefficients[1, 1],
+    Slope = coefficients[2, 1],
+    Std_Error = coefficients[2, 2],
+    T_Value = coefficients[2, 3],
+    P_Value = coefficients[2, 4]))}
+
+results_table_premis <- kable(results_df_premis, format = "html", 
+                              col.names = c("Crime Premis Type", "Intercept", "Slope", "Std Error", "T Value", "P Value"),
+                              caption = "Simple Linear Regression Results by Crime Premis Type") %>%
+  kable_styling(full_width = FALSE, position = "center")
+print(results_table_premis)
+
+# Create an empty data frame to store time results
+results_df_time_interval <- data.frame()
+for (time_interval_category in c('time_midnight', 'time_morning', 'time_afternoon', 'time_night')) {
+  
+  model <- lm(AA_ratio ~ get(time_interval_category), data = correlation_data)
+  coefficients <- summary(model)$coefficients
+  results_df_time_interval <- rbind(results_df_time_interval, data.frame(
+    time_interval_Category = time_interval_category,
+    Intercept = coefficients[1, 1],
+    Slope = coefficients[2, 1],
+    Std_Error = coefficients[2, 2],
+    T_Value = coefficients[2, 3],
+    P_Value = coefficients[2, 4]))}
+
+results_table_time_interval <- kable(results_df_time_interval, format = "html", 
+                                     col.names = c("Crime Occurence Time", "Intercept", "Slope", "Std Error", "T Value", "P Value"),
+                                     caption = "Simple Linear Regression Results by Crime Occurence Time") %>%
+  kable_styling(full_width = FALSE, position = "center")
+print(results_table_time_interval)
+
+# Time Interval Variable Linear Regression
+time_interval_long_data <- data_spread %>%
+  gather(key = "variable", value = "value", time_midnight, time_morning, time_afternoon, time_night)
+ggplot(time_interval_long_data, aes(x = value, y = AA_ratio, color = variable)) +
+  geom_point(show.legend = FALSE) +  # Optional: Add the actual data points
+  geom_smooth(method = "lm", se = FALSE, show.legend = FALSE) +  # Add the regression lines
+  facet_wrap(~variable, scales = "free_x") +  # Create a separate plot for each variable
+  theme_minimal() +
+  labs(x = "Crime Occurence Time Ratio", y = "Case Solved Ratio", title = "Linear Regressions by Crime Occurence Time") +
+  scale_color_viridis_d()  
+
+
+multiple_model <- lm(AA_ratio ~ #F 
+                       + crm_cd_624
+                     + crm_cd_330
+                     #+ crm_cd_354
+                     #+ crm_cd_230
+                     + crm_cd_331
+                     #+ weapon_102
+                     + weapon_109
+                     + weapon_400
+                     + weapon_500
+                     + weapon_511
+                     + age_0_17
+                     + age_18_35
+                     + age_36_51
+                     #+ age_52_69
+                     + age_70_86
+                     #+ age_86_above
+                     + premis_101
+                     + premis_501
+                     + premis_502
+                     + premis_108
+                     #+ time_midnight
+                     + time_morning
+                     + time_afternoon
+                     #+ time_night
+                     + ethnicity_W
+                     + ethnicity_H
+                     + ethnicity_B
+                     + M,
+                     data = data_spread)
+summary(multiple_model)
+
+
+plot(fitted(multiple_model), resid(multiple_model))
+abline(h = 0, col = "red") # Adds a horizontal line at 0
+
+# Plot with CI
+predictions_with_ci <- predict(multiple_model, newdata = data_spread, interval = "confidence")
+# Create a data frame from the predictions
+predictions_df <- cbind(data_spread, as.data.frame(predictions_with_ci))
+ggplot(predictions_df, aes(x = fit, y = AA_ratio)) +  # Fitted values on x-axis and actual values on y-axis
+  geom_point(color = "steelblue2") +  # Actual data points
+  geom_line(aes(y = fit), color = "coral") +  # Regression line, y is the fitted values from the model
+  geom_ribbon(aes(ymin = lwr, ymax = upr), alpha = 0.2, fill = "orange") +  # Confidence interval area
+  labs(x = "Fitted Values", y = "Actual Case Solved Ratio", title = "Linear Regression with Confidence Intervals") +
+  theme_minimal()
+
+
+qqnorm(residuals(multiple_model))
+qqline(residuals(multiple_model), col = "red")
+
+shapiro.test(residuals(multiple_model))
+
+bptest(multiple_model)
+
+
+
+
+
+
+
